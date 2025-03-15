@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -473,6 +474,8 @@ func FetchComposeContainers(
 
 	// Filter containers that match the project
 	var composeContainers []docker.ContainerInfo
+
+	// First pass: check for exact container names or labels
 	for _, container := range containers {
 		// Check if container name contains the project name
 		matched := false
@@ -529,6 +532,69 @@ func FetchComposeContainers(
 							}
 						}
 					}
+				}
+			}
+		}
+	}
+
+	// If we still have no containers, try using the Docker Compose CLI
+	if len(composeContainers) == 0 {
+		// Try using docker compose ps to get containers directly
+		cmd := exec.Command("docker", "compose", "--project-name", projectName, "ps", "--format", "json")
+		output, err := cmd.CombinedOutput()
+		if err == nil && len(output) > 0 {
+			// Try to parse as JSON
+			var containerList []map[string]interface{}
+			if jsonErr := json.Unmarshal(output, &containerList); jsonErr == nil {
+				for _, c := range containerList {
+					if id, ok := c["ID"].(string); ok {
+						// Found container ID, try to find it in our main list
+						for _, existingContainer := range containers {
+							if strings.HasPrefix(existingContainer.ID, id) ||
+								(len(id) >= 12 && len(existingContainer.ID) >= 12 &&
+									strings.HasPrefix(existingContainer.ID, id[:12])) {
+								// Add the container if not already in the list
+								alreadyAdded := false
+								for _, added := range composeContainers {
+									if added.ID == existingContainer.ID {
+										alreadyAdded = true
+										break
+									}
+								}
+								if !alreadyAdded {
+									composeContainers = append(composeContainers, existingContainer)
+								}
+								break
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// If we still have no matches, consider any container with matching names
+	if len(composeContainers) == 0 {
+		// Deep name-based search
+		for _, container := range containers {
+			// In some cases, the path component in the container name is relevant
+			parts := strings.Split(container.Name, "_")
+			for _, part := range parts {
+				if strings.EqualFold(part, normalizedProjectName) ||
+					strings.EqualFold(part, dashVariant) ||
+					strings.EqualFold(part, underscoreVariant) {
+					// Add the container if not already in the list
+					alreadyAdded := false
+					for _, added := range composeContainers {
+						if added.ID == container.ID {
+							alreadyAdded = true
+							break
+						}
+					}
+					if !alreadyAdded {
+						composeContainers = append(composeContainers, container)
+					}
+					break
 				}
 			}
 		}

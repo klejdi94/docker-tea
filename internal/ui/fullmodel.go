@@ -1292,8 +1292,11 @@ func (m FullModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							// Get the container ID
 							selectedID := m.composeContainers[num-1].ID
 
-							// Clear the status message
-							m.statusMsg = ""
+							// Store the container name for better user feedback
+							selectedName := m.composeContainers[num-1].Name
+
+							// Clear the status message and provide feedback
+							m.statusMsg = fmt.Sprintf("Switching to container: %s", selectedName)
 
 							// Jump to the container tab with that container selected
 							m.jumpToContainer(selectedID)
@@ -1307,8 +1310,8 @@ func (m FullModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						}
 					}
 
-					// Invalid input - clear status
-					m.statusMsg = ""
+					// Invalid input - clear status and show message
+					m.statusMsg = "Invalid container number. Cancelled selection."
 				}
 
 				// Continue with existing compose actions
@@ -2194,6 +2197,12 @@ func (m FullModel) fetchComposeContainers() tea.Msg {
 
 // Helper function to jump to a specific container
 func (m *FullModel) jumpToContainer(id string) {
+	// First, refresh the container list to ensure we have the latest data
+	containers, err := m.docker.ListContainers(m.ctx, true)
+	if err == nil {
+		m.containers = containers
+	}
+
 	// Switch to Containers tab
 	m.currentTab = ContainersTab
 	m.currentMode = ListMode
@@ -2216,6 +2225,10 @@ func (m *FullModel) jumpToContainer(id string) {
 		for _, c := range m.composeContainers {
 			if strings.HasPrefix(c.ID, id) {
 				containerName = c.Name
+				// Handle service name in parentheses
+				if idx := strings.Index(containerName, " ("); idx > 0 {
+					containerName = containerName[:idx]
+				}
 				break
 			}
 		}
@@ -2223,10 +2236,24 @@ func (m *FullModel) jumpToContainer(id string) {
 		// If we found a name, look for it in the main containers list
 		if containerName != "" {
 			for i, container := range m.containers {
-				if container.Name == containerName {
+				// Some container names have a leading slash that needs to be trimmed
+				name := strings.TrimPrefix(container.Name, "/")
+				if name == containerName {
 					foundIndex = i
 					break
 				}
+			}
+		}
+	}
+
+	// If still not found, try a more fuzzy matching approach with container IDs
+	if foundIndex == -1 {
+		// Try matching just the first few characters of the ID
+		for i, container := range m.containers {
+			if len(id) >= 6 && len(container.ID) >= 6 &&
+				strings.EqualFold(container.ID[:6], id[:6]) {
+				foundIndex = i
+				break
 			}
 		}
 	}
@@ -2237,6 +2264,6 @@ func (m *FullModel) jumpToContainer(id string) {
 		m.updateSelection()
 		m.statusMsg = fmt.Sprintf("Selected container: %s", m.containers[foundIndex].Name)
 	} else {
-		m.statusMsg = fmt.Sprintf("Container not found. Try refreshing container list.")
+		m.statusMsg = fmt.Sprintf("Container not found in main list. Try refreshing.")
 	}
 }
