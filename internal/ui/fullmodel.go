@@ -3,16 +3,20 @@ package ui
 import (
 	"context"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/key"
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/table"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/klejdi94/docker-tea/internal/config"
 	"github.com/klejdi94/docker-tea/internal/docker"
+	"github.com/klejdi94/docker-tea/internal/ui/views"
 )
 
 // Icons for UI elements
@@ -22,6 +26,7 @@ const (
 	IconImage     = "📦 "
 	IconVolume    = "💾 "
 	IconNetwork   = "🌐 "
+	IconCompose   = "🔄 "
 
 	// Status icons
 	IconRunning    = "🟢 "
@@ -64,6 +69,7 @@ const (
 	ImagesTab
 	VolumesTab
 	NetworksTab
+	ComposeTab
 	LogsTab
 )
 
@@ -79,33 +85,44 @@ const (
 
 // FullModel represents the complete Bubble Tea model for Docker TUI
 type FullModel struct {
-	config          *config.Config
-	docker          *docker.Service
-	ctx             context.Context
-	width           int
-	height          int
-	loading         bool
-	err             error
-	dockerConnected bool
-	containerTable  table.Model
-	imageTable      table.Model
-	volumeTable     table.Model
-	networkTable    table.Model
-	viewport        viewport.Model
-	currentTab      Tab
-	currentMode     Mode
-	statusMsg       string
-	containers      []docker.ContainerInfo
-	images          []docker.ImageInfo
-	volumes         []docker.VolumeInfo
-	networks        []docker.NetworkInfo
-	logContent      string
-	inspectContent  string
-	statsContent    string
-	selectedID      string
-	selectedName    string
-	showHelp        bool
-	ticker          *time.Ticker
+	config                   *config.Config
+	docker                   *docker.Service
+	ctx                      context.Context
+	width                    int
+	height                   int
+	loading                  bool
+	err                      error
+	dockerConnected          bool
+	containerTable           table.Model
+	imageTable               table.Model
+	volumeTable              table.Model
+	networkTable             table.Model
+	composeTable             table.Model
+	viewport                 viewport.Model
+	currentTab               Tab
+	currentMode              Mode
+	statusMsg                string
+	containers               []docker.ContainerInfo
+	images                   []docker.ImageInfo
+	volumes                  []docker.VolumeInfo
+	networks                 []docker.NetworkInfo
+	composeProjects          []docker.ComposeInfo
+	logContent               string
+	inspectContent           string
+	statsContent             string
+	selectedID               string
+	selectedName             string
+	selectedPath             string
+	showHelp                 bool
+	ticker                   *time.Ticker
+	composeServices          []docker.ComposeServiceInfo
+	composeServicesLoading   bool
+	selectedProject          string
+	selectedProjectPath      string
+	loadingCompose           bool
+	spinner                  spinner.Model
+	composeContainers        []docker.ContainerInfo
+	composeContainersLoading bool
 }
 
 // FullKeyMap defines the keybindings for the application
@@ -141,6 +158,11 @@ type FullKeyMap struct {
 	Resume  key.Binding
 	Kill    key.Binding
 	Remove  key.Binding
+
+	// Compose actions
+	ComposeUp   key.Binding
+	ComposeDown key.Binding
+	ComposePull key.Binding
 }
 
 var FullKeyMapHelp = [][]key.Binding{
@@ -173,6 +195,12 @@ var FullKeyMapHelp = [][]key.Binding{
 		DefaultFullKeyMap.Resume,
 		DefaultFullKeyMap.Kill,
 		DefaultFullKeyMap.Remove,
+	},
+	// Compose Actions
+	{
+		DefaultFullKeyMap.ComposeUp,
+		DefaultFullKeyMap.ComposeDown,
+		DefaultFullKeyMap.ComposePull,
 	},
 }
 
@@ -271,24 +299,47 @@ var DefaultFullKeyMap = FullKeyMap{
 		key.WithHelp("K", "kill"),
 	),
 	Remove: key.NewBinding(
-		key.WithKeys("d", "delete"),
-		key.WithHelp("d", "remove"),
+		key.WithKeys("delete"),
+		key.WithHelp("delete", "remove"),
+	),
+
+	// Compose actions
+	ComposeUp: key.NewBinding(
+		key.WithKeys("u"),
+		key.WithHelp("u", "up"),
+	),
+	ComposeDown: key.NewBinding(
+		key.WithKeys("d"),
+		key.WithHelp("d", "down"),
+	),
+	ComposePull: key.NewBinding(
+		key.WithKeys("p"),
+		key.WithHelp("p", "pull"),
 	),
 }
 
 // NewFullModel creates a new model for Docker Tea
 func NewFullModel(dockerService *docker.Service, config *config.Config, ctx context.Context) FullModel {
-	return FullModel{
-		config:          config,
-		docker:          dockerService,
-		ctx:             ctx,
-		loading:         true,
-		dockerConnected: true, // Assume connected, we'll check immediately
-		statusMsg:       "Initializing...",
-		currentTab:      ContainersTab,
-		currentMode:     ListMode,
-		viewport:        viewport.New(0, 0),
+	// Initialize spinner
+	s := spinner.New()
+	s.Spinner = spinner.Dot
+	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
+
+	m := FullModel{
+		config:            config,
+		docker:            dockerService,
+		ctx:               ctx,
+		loading:           true,
+		dockerConnected:   true, // Assume connected, we'll check immediately
+		statusMsg:         "Initializing...",
+		currentTab:        ContainersTab,
+		currentMode:       ListMode,
+		viewport:          viewport.New(0, 0),
+		spinner:           s,
+		composeContainers: []docker.ContainerInfo{},
 	}
+
+	return m
 }
 
 // Init initializes the model
@@ -299,6 +350,7 @@ func (m FullModel) Init() tea.Cmd {
 		m.fetchImages,
 		m.fetchVolumes,
 		m.fetchNetworks,
+		m.fetchComposeProjects,
 	)
 }
 
@@ -360,6 +412,22 @@ func (m FullModel) fetchNetworks() tea.Msg {
 		return fullErrMsg{err}
 	}
 	return fullNetworksMsg{networks}
+}
+
+// fetchComposeProjects fetches Docker Compose projects
+func (m FullModel) fetchComposeProjects() tea.Msg {
+	m.statusMsg = "Fetching Docker Compose projects..."
+	// Don't make the call if we're not connected to Docker
+	if !m.dockerConnected {
+		return composeProjectsMsg{projects: []docker.ComposeInfo{}}
+	}
+
+	projects, err := m.docker.ListComposeProjects(m.ctx)
+	if err != nil {
+		return fullErrMsg{err}
+	}
+
+	return composeProjectsMsg{projects: projects}
 }
 
 // fetchLogs fetches logs for a container
@@ -503,6 +571,135 @@ func (m FullModel) inspectResource() tea.Msg {
 		return fullErrMsg{err}
 	}
 	return fullInspectMsg{details}
+}
+
+// inspectComposeProject fetches details for a Docker Compose project
+func (m *FullModel) inspectComposeProject() tea.Msg {
+	if m.selectedPath == "" {
+		// Try to find the path from the compose projects list
+		for _, project := range m.composeProjects {
+			if project.Name == m.selectedName {
+				m.selectedPath = project.Path
+				break
+			}
+		}
+
+		// If we still don't have a path, return an error
+		if m.selectedPath == "" {
+			return fullInspectMsg{fmt.Sprintf("No Docker Compose project path found for %s.\nPlease refresh the projects list and try again.",
+				m.selectedName)}
+		}
+	}
+
+	m.statusMsg = fmt.Sprintf("Inspecting Docker Compose project: %s at %s", m.selectedName, m.selectedPath)
+	m.composeServicesLoading = true
+
+	return tea.Batch(
+		func() tea.Msg {
+			return fullInspectMsg{fmt.Sprintf("Loading services for %s at %s...", m.selectedName, m.selectedPath)}
+		},
+		m.fetchComposeServices,
+		m.fetchComposeContainers,
+	)
+}
+
+// fetchComposeServices fetches Docker Compose services for a project
+func (m FullModel) fetchComposeServices() tea.Msg {
+	if m.selectedPath == "" {
+		return fullComposeServicesMsg{
+			services:    []docker.ComposeServiceInfo{},
+			projectName: m.selectedName,
+			error:       fmt.Errorf("no project path available for %s", m.selectedName),
+		}
+	}
+
+	// Check if the path exists before trying to use it
+	if _, err := os.Stat(m.selectedPath); os.IsNotExist(err) {
+		return fullComposeServicesMsg{
+			services:    []docker.ComposeServiceInfo{},
+			projectName: m.selectedName,
+			error:       fmt.Errorf("project path does not exist: %s", m.selectedPath),
+		}
+	}
+
+	m.statusMsg = fmt.Sprintf("Fetching services for %s at %s...", m.selectedName, m.selectedPath)
+
+	// Add timeout to the context to prevent hanging
+	ctx, cancel := context.WithTimeout(m.ctx, 10*time.Second)
+	defer cancel()
+
+	// Now try to list services
+	services, err := m.docker.ListComposeServices(ctx, m.selectedPath)
+	if err != nil {
+		errMsg := err.Error()
+		// Try to provide more user-friendly error messages based on common errors
+		if strings.Contains(errMsg, "no compose file found") {
+			errMsg = fmt.Sprintf("No docker-compose.yml or compose.yaml file found in %s", m.selectedPath)
+		} else if strings.Contains(errMsg, "failed to parse compose file") {
+			errMsg = fmt.Sprintf("The compose file in %s has invalid syntax", m.selectedPath)
+		} else if strings.Contains(errMsg, "no services found") {
+			errMsg = fmt.Sprintf("No services found in the compose file in %s. Check if it has a 'services:' section.", m.selectedPath)
+		}
+
+		return fullComposeServicesMsg{
+			services:    []docker.ComposeServiceInfo{},
+			projectName: m.selectedName,
+			error:       fmt.Errorf("%s", errMsg),
+		}
+	}
+
+	if len(services) == 0 {
+		// Return an error message that's more user-friendly
+		return fullComposeServicesMsg{
+			services:    []docker.ComposeServiceInfo{},
+			projectName: m.selectedName,
+			error:       fmt.Errorf("no services defined in the compose file for %s", m.selectedName),
+		}
+	}
+
+	return fullComposeServicesMsg{
+		services:    services,
+		projectName: m.selectedName,
+	}
+}
+
+// composeAction performs an action on a Docker Compose project
+func (m FullModel) composeAction(action string) tea.Cmd {
+	return func() tea.Msg {
+		if m.selectedPath == "" {
+			return fullActionResultMsg{success: false, message: "No Docker Compose project selected"}
+		}
+
+		m.statusMsg = fmt.Sprintf("Performing %s on %s...", action, m.selectedName)
+		var err error
+
+		switch action {
+		case "up":
+			err = m.docker.ComposeUp(m.ctx, m.selectedPath)
+		case "down":
+			err = m.docker.ComposeDown(m.ctx, m.selectedPath)
+		case "pull":
+			err = m.docker.ComposePull(m.ctx, m.selectedPath)
+		case "logs":
+			// For logs, we need to fetch and format them
+			logs, logErr := m.docker.ComposeLogs(m.ctx, m.selectedPath)
+			if logErr != nil {
+				err = logErr
+			} else {
+				return fullLogsMsg{logs}
+			}
+		}
+
+		if err != nil {
+			return fullActionResultMsg{success: false, message: err.Error()}
+		}
+
+		return fullActionResultMsg{
+			success: true,
+			message: fmt.Sprintf("Successfully performed %s on %s", action, m.selectedName),
+			action:  action,
+		}
+	}
 }
 
 // containerAction performs an action on a container
@@ -656,6 +853,12 @@ func (m *FullModel) initializeTable(resourceType Tab) table.Model {
 			{Title: "SCOPE", Width: 15},
 			{Title: "ID", Width: 20},
 		}
+	case ComposeTab:
+		columns = []table.Column{
+			{Title: "NAME", Width: 25},
+			{Title: "STATUS", Width: 15},
+			{Title: "PATH", Width: 40},
+		}
 	}
 
 	t := table.New(
@@ -705,6 +908,11 @@ func (m *FullModel) updateTables() {
 		m.networkTable.SetWidth(m.width)
 	}
 
+	if m.composeTable.Height() != height {
+		m.composeTable.SetHeight(height)
+		m.composeTable.SetWidth(m.width)
+	}
+
 	// Set viewport height based on current mode
 	var viewportHeight int
 	if m.currentMode == InspectMode {
@@ -732,6 +940,8 @@ func (m *FullModel) getCurrentTable() *table.Model {
 		return &m.volumeTable
 	case NetworksTab:
 		return &m.networkTable
+	case ComposeTab:
+		return &m.composeTable
 	default:
 		return &m.containerTable
 	}
@@ -745,6 +955,7 @@ func (m *FullModel) updateSelection() {
 	if len(selectedRow) == 0 {
 		m.selectedID = ""
 		m.selectedName = ""
+		m.selectedPath = ""
 		return
 	}
 
@@ -775,6 +986,42 @@ func (m *FullModel) updateSelection() {
 			m.selectedID = m.networks[table.Cursor()].ID
 			m.selectedName = m.networks[table.Cursor()].Name
 		}
+
+	case ComposeTab:
+		if len(m.composeProjects) > 0 && table.Cursor() < len(m.composeProjects) {
+			cursorIndex := table.Cursor()
+			if cursorIndex >= len(m.composeProjects) {
+				// Stay safe
+				cursorIndex = 0
+			}
+
+			selectedProject := m.composeProjects[cursorIndex]
+			m.selectedID = selectedProject.Name
+			m.selectedName = selectedProject.Name
+			m.selectedPath = selectedProject.Path
+
+			// If path is empty, try to search for it by name
+			if m.selectedPath == "" && m.selectedID != "" {
+				for _, p := range m.composeProjects {
+					if p.Name == m.selectedID {
+						m.selectedPath = p.Path
+						m.statusMsg = fmt.Sprintf("Found project path: %s", m.selectedPath)
+						break
+					}
+				}
+
+				// If still no path, check if there are any projects with paths at all
+				if m.selectedPath == "" {
+					for _, p := range m.composeProjects {
+						if p.Path != "" {
+							m.selectedPath = p.Path
+							m.statusMsg = fmt.Sprintf("Using fallback path from project %s: %s", p.Name, p.Path)
+							break
+						}
+					}
+				}
+			}
+		}
 	}
 }
 
@@ -802,6 +1049,9 @@ func (m FullModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			if m.currentMode == InspectMode {
 				// Refresh the inspection
+				if m.currentTab == ComposeTab {
+					return m, m.inspectComposeProject
+				}
 				return m, m.inspectResource
 			}
 
@@ -811,17 +1061,81 @@ func (m FullModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.fetchImages,
 				m.fetchVolumes,
 				m.fetchNetworks,
+				m.fetchComposeProjects,
 			)
 
 		case key.Matches(msg, DefaultFullKeyMap.NextTab):
 			if m.currentMode == ListMode {
-				m.currentTab = (m.currentTab + 1) % 4 // Cycle through the tabs
+				prevTab := m.currentTab
+				m.currentTab = (m.currentTab + 1) % 5 // Cycle through the 5 tabs (including Compose)
+
+				// If we're switching to a different tab, ensure data is refreshed
+				if prevTab != m.currentTab {
+					switch m.currentTab {
+					case ContainersTab:
+						return m, m.fetchContainers
+					case ImagesTab:
+						return m, m.fetchImages
+					case VolumesTab:
+						return m, m.fetchVolumes
+					case NetworksTab:
+						return m, m.fetchNetworks
+					case ComposeTab:
+						return m, m.fetchComposeProjects
+					}
+				}
+
+				// If switching to Compose tab, refresh compose projects
+				if m.currentTab == ComposeTab {
+					var cmds []tea.Cmd
+					// Always refresh projects
+					cmds = append(cmds, func() tea.Msg {
+						return m.fetchComposeProjects()
+					})
+
+					// If in inspect mode with a selected project, fetch services too
+					if m.currentMode == InspectMode && m.selectedPath != "" {
+						cmds = append(cmds, func() tea.Msg {
+							return m.fetchComposeServices()
+						})
+					}
+
+					if len(cmds) > 0 {
+						return m, tea.Batch(cmds...)
+					}
+				}
+
 				return m, nil
 			}
 
 		case key.Matches(msg, DefaultFullKeyMap.PrevTab):
 			if m.currentMode == ListMode {
-				m.currentTab = (m.currentTab - 1 + 4) % 4 // Cycle through the tabs
+				prevTab := m.currentTab
+				m.currentTab = (m.currentTab - 1 + 5) % 5 // Cycle through the 5 tabs (including Compose)
+
+				// If we're switching to a different tab, ensure data is refreshed
+				if prevTab != m.currentTab {
+					switch m.currentTab {
+					case ContainersTab:
+						return m, m.fetchContainers
+					case ImagesTab:
+						return m, m.fetchImages
+					case VolumesTab:
+						return m, m.fetchVolumes
+					case NetworksTab:
+						return m, m.fetchNetworks
+					case ComposeTab:
+						return m, m.fetchComposeProjects
+					}
+				}
+
+				// If switching to Compose tab, refresh compose projects
+				if m.currentTab == ComposeTab {
+					cmds = append(cmds, func() tea.Msg {
+						return m.fetchComposeProjects()
+					})
+				}
+
 				return m, nil
 			}
 
@@ -837,23 +1151,74 @@ func (m FullModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		// Handle action keys
+		// Handle action keys in ListMode
 		if m.currentMode == ListMode {
 			// Update selection before performing actions
 			m.updateSelection()
 
+			// Process ComposeTab actions first if we're in ComposeTab to avoid conflicts with 'd' key
+			if m.currentTab == ComposeTab {
+				switch {
+				case key.Matches(msg, DefaultFullKeyMap.ComposeUp):
+					return m, m.composeAction("up")
+				case key.Matches(msg, DefaultFullKeyMap.ComposeDown):
+					return m, m.composeAction("down")
+				case key.Matches(msg, DefaultFullKeyMap.ComposePull):
+					return m, m.composeAction("pull")
+				}
+			}
+
+			// Process shared actions for all tabs
 			switch {
 			case key.Matches(msg, DefaultFullKeyMap.Inspect):
 				if m.selectedID != "" {
 					m.currentMode = InspectMode
+					if m.currentTab == ComposeTab {
+						// Force update selection to ensure selectedPath is set properly
+						m.updateSelection()
+
+						// If path is still empty despite having a selected ID, try to find it in all projects
+						if m.selectedPath == "" && m.selectedID != "" && len(m.composeProjects) > 0 {
+							// Look for any project with matching name
+							for _, p := range m.composeProjects {
+								if p.Name == m.selectedID || p.Name == m.selectedName {
+									m.selectedPath = p.Path
+									m.statusMsg = fmt.Sprintf("Found project path: %s", m.selectedPath)
+									break
+								}
+							}
+
+							// If still no path, check if there are any projects with paths at all
+							if m.selectedPath == "" {
+								for _, p := range m.composeProjects {
+									if p.Path != "" {
+										m.selectedPath = p.Path
+										m.statusMsg = fmt.Sprintf("Using fallback path from project %s: %s", p.Name, m.selectedPath)
+										break
+									}
+								}
+							}
+						}
+
+						// Set the viewport content directly for immediate display
+						content := m.renderComposeInspect()
+						m.viewport.SetContent(content)
+						m.viewport.GotoTop()
+
+						// Then fetch services async
+						return m, m.inspectComposeProject
+					}
 					return m, m.inspectResource
 				}
 
 			case key.Matches(msg, DefaultFullKeyMap.Logs):
-				// Only containers have logs
+				// Containers and Compose projects have logs
 				if m.currentTab == ContainersTab && m.selectedID != "" {
 					m.currentMode = LogsMode
 					return m, m.fetchLogs
+				} else if m.currentTab == ComposeTab && m.selectedPath != "" {
+					m.currentMode = LogsMode
+					return m, m.composeAction("logs")
 				}
 
 			case key.Matches(msg, DefaultFullKeyMap.Monitor):
@@ -865,40 +1230,42 @@ func (m FullModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.startStatsRefresh(),
 					)
 				}
+			}
 
-			// Container actions - only apply in containers tab
-			case m.currentTab == ContainersTab && key.Matches(msg, DefaultFullKeyMap.Start):
-				return m, m.containerAction("start")
-
-			case m.currentTab == ContainersTab && key.Matches(msg, DefaultFullKeyMap.Stop):
-				return m, m.containerAction("stop")
-
-			case m.currentTab == ContainersTab && key.Matches(msg, DefaultFullKeyMap.Restart):
-				return m, m.containerAction("restart")
-
-			case m.currentTab == ContainersTab && key.Matches(msg, DefaultFullKeyMap.Pause):
-				return m, m.containerAction("pause")
-
-			case m.currentTab == ContainersTab && key.Matches(msg, DefaultFullKeyMap.Resume):
-				return m, m.containerAction("unpause")
-
-			case m.currentTab == ContainersTab && key.Matches(msg, DefaultFullKeyMap.Kill):
-				return m, m.containerAction("kill")
-
-			case m.currentTab == ContainersTab && key.Matches(msg, DefaultFullKeyMap.Remove):
-				return m, m.containerAction("remove")
-
-			// Image actions - only apply in images tab
-			case m.currentTab == ImagesTab && key.Matches(msg, DefaultFullKeyMap.Remove):
-				return m, m.imageAction("remove")
-
-			// Volume actions - only apply in volumes tab
-			case m.currentTab == VolumesTab && key.Matches(msg, DefaultFullKeyMap.Remove):
-				return m, m.volumeAction("remove")
-
-			// Network actions - only apply in networks tab
-			case m.currentTab == NetworksTab && key.Matches(msg, DefaultFullKeyMap.Remove):
-				return m, m.networkAction("remove")
+			// Handle tab-specific actions based on current tab
+			switch m.currentTab {
+			case ContainersTab:
+				switch {
+				case key.Matches(msg, DefaultFullKeyMap.Start):
+					return m, m.containerAction("start")
+				case key.Matches(msg, DefaultFullKeyMap.Stop):
+					return m, m.containerAction("stop")
+				case key.Matches(msg, DefaultFullKeyMap.Restart):
+					return m, m.containerAction("restart")
+				case key.Matches(msg, DefaultFullKeyMap.Pause):
+					return m, m.containerAction("pause")
+				case key.Matches(msg, DefaultFullKeyMap.Resume):
+					return m, m.containerAction("unpause")
+				case key.Matches(msg, DefaultFullKeyMap.Kill):
+					return m, m.containerAction("kill")
+				case key.Matches(msg, DefaultFullKeyMap.Remove):
+					return m, m.containerAction("remove")
+				}
+			case ImagesTab:
+				switch {
+				case key.Matches(msg, DefaultFullKeyMap.Remove):
+					return m, m.imageAction("remove")
+				}
+			case VolumesTab:
+				switch {
+				case key.Matches(msg, DefaultFullKeyMap.Remove):
+					return m, m.volumeAction("remove")
+				}
+			case NetworksTab:
+				switch {
+				case key.Matches(msg, DefaultFullKeyMap.Remove):
+					return m, m.networkAction("remove")
+				}
 			}
 
 			// Handle navigation keys for tables
@@ -908,13 +1275,84 @@ func (m FullModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cmds = append(cmds, cmd)
 			}
 		} else if m.currentMode == InspectMode {
-			// Allow actions directly from inspect mode
+			// Similar approach in inspect mode: handle ComposeTab actions first if applicable
+			if m.currentTab == ComposeTab {
+				// Add container selection feature
+				if msg.String() == "c" {
+					m.statusMsg = "Enter container number (1-9):"
+					return m, nil
+				}
+
+				// Check for number keys 1-9 after pressing 'c'
+				if m.statusMsg == "Enter container number (1-9):" {
+					numStr := msg.String()
+					if numStr >= "1" && numStr <= "9" {
+						num, err := strconv.Atoi(numStr)
+						if err == nil && num >= 1 && num <= 9 && num <= len(m.composeContainers) {
+							// Get the container ID
+							selectedID := m.composeContainers[num-1].ID
+
+							// Store the container name for better user feedback
+							selectedName := m.composeContainers[num-1].Name
+
+							// Clear the status message and provide feedback
+							m.statusMsg = fmt.Sprintf("Switching to container: %s", selectedName)
+
+							// Jump to the container tab with that container selected
+							m.jumpToContainer(selectedID)
+
+							return m, nil
+						} else if err == nil && num >= 1 && num <= 9 {
+							// Invalid container number
+							m.statusMsg = fmt.Sprintf("Container %d not found. Valid range: 1-%d",
+								num, len(m.composeContainers))
+							return m, nil
+						}
+					}
+
+					// Invalid input - clear status and show message
+					m.statusMsg = "Invalid container number. Cancelled selection."
+				}
+
+				// Continue with existing compose actions
+				switch {
+				case key.Matches(msg, DefaultFullKeyMap.ComposeUp):
+					m.statusMsg = "Starting Docker Compose project..."
+					return m, tea.Batch(
+						m.composeAction("up"),
+						func() tea.Msg {
+							return afterActionMsg{action: "inspect"}
+						},
+					)
+				case key.Matches(msg, DefaultFullKeyMap.ComposeDown):
+					m.statusMsg = "Stopping Docker Compose project..."
+					return m, tea.Batch(
+						m.composeAction("down"),
+						func() tea.Msg {
+							return afterActionMsg{action: "inspect"}
+						},
+					)
+				case key.Matches(msg, DefaultFullKeyMap.ComposePull):
+					m.statusMsg = "Pulling Docker Compose images..."
+					return m, tea.Batch(
+						m.composeAction("pull"),
+						func() tea.Msg {
+							return afterActionMsg{action: "inspect"}
+						},
+					)
+				}
+			}
+
+			// Shared actions in inspect mode
 			switch {
 			case key.Matches(msg, DefaultFullKeyMap.Logs):
-				// Only containers have logs
+				// Containers and Compose projects have logs
 				if m.currentTab == ContainersTab && m.selectedID != "" {
 					m.currentMode = LogsMode
 					return m, m.fetchLogs
+				} else if m.currentTab == ComposeTab && m.selectedPath != "" {
+					m.currentMode = LogsMode
+					return m, m.composeAction("logs")
 				}
 
 			case key.Matches(msg, DefaultFullKeyMap.Monitor):
@@ -926,101 +1364,102 @@ func (m FullModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.startStatsRefresh(),
 					)
 				}
+			}
 
-			// Container actions - only apply in containers tab
-			case m.currentTab == ContainersTab && key.Matches(msg, DefaultFullKeyMap.Start):
-				m.statusMsg = "Starting container..."
-				return m, tea.Batch(
-					m.containerAction("start"),
-					// Return to inspect mode after action completes
-					func() tea.Msg {
-						return afterActionMsg{action: "inspect"}
-					},
-				)
-
-			case m.currentTab == ContainersTab && key.Matches(msg, DefaultFullKeyMap.Stop):
-				m.statusMsg = "Stopping container..."
-				return m, tea.Batch(
-					m.containerAction("stop"),
-					func() tea.Msg {
-						return afterActionMsg{action: "inspect"}
-					},
-				)
-
-			case m.currentTab == ContainersTab && key.Matches(msg, DefaultFullKeyMap.Restart):
-				m.statusMsg = "Restarting container..."
-				return m, tea.Batch(
-					m.containerAction("restart"),
-					func() tea.Msg {
-						return afterActionMsg{action: "inspect"}
-					},
-				)
-
-			case m.currentTab == ContainersTab && key.Matches(msg, DefaultFullKeyMap.Pause):
-				m.statusMsg = "Pausing container..."
-				return m, tea.Batch(
-					m.containerAction("pause"),
-					func() tea.Msg {
-						return afterActionMsg{action: "inspect"}
-					},
-				)
-
-			case m.currentTab == ContainersTab && key.Matches(msg, DefaultFullKeyMap.Resume):
-				m.statusMsg = "Unpausing container..."
-				return m, tea.Batch(
-					m.containerAction("unpause"),
-					func() tea.Msg {
-						return afterActionMsg{action: "inspect"}
-					},
-				)
-
-			case m.currentTab == ContainersTab && key.Matches(msg, DefaultFullKeyMap.Kill):
-				m.statusMsg = "Killing container..."
-				return m, tea.Batch(
-					m.containerAction("kill"),
-					func() tea.Msg {
-						return afterActionMsg{action: "list"}
-					},
-				)
-
-			case m.currentTab == ContainersTab && key.Matches(msg, DefaultFullKeyMap.Remove):
-				m.statusMsg = "Removing container..."
-				return m, tea.Batch(
-					m.containerAction("remove"),
-					func() tea.Msg {
-						return afterActionMsg{action: "list"}
-					},
-				)
-
-			// Image actions in inspect mode
-			case m.currentTab == ImagesTab && key.Matches(msg, DefaultFullKeyMap.Remove):
-				m.statusMsg = "Removing image..."
-				return m, tea.Batch(
-					m.imageAction("remove"),
-					func() tea.Msg {
-						return afterActionMsg{action: "list"}
-					},
-				)
-
-			// Volume actions in inspect mode
-			case m.currentTab == VolumesTab && key.Matches(msg, DefaultFullKeyMap.Remove):
-				m.statusMsg = "Removing volume..."
-				return m, tea.Batch(
-					m.volumeAction("remove"),
-					func() tea.Msg {
-						return afterActionMsg{action: "list"}
-					},
-				)
-
-			// Network actions in inspect mode
-			case m.currentTab == NetworksTab && key.Matches(msg, DefaultFullKeyMap.Remove):
-				m.statusMsg = "Removing network..."
-				return m, tea.Batch(
-					m.networkAction("remove"),
-					func() tea.Msg {
-						return afterActionMsg{action: "list"}
-					},
-				)
+			// Handle tab-specific actions in inspect mode
+			switch m.currentTab {
+			case ContainersTab:
+				switch {
+				case key.Matches(msg, DefaultFullKeyMap.Start):
+					m.statusMsg = "Starting container..."
+					return m, tea.Batch(
+						m.containerAction("start"),
+						func() tea.Msg {
+							return afterActionMsg{action: "inspect"}
+						},
+					)
+				case key.Matches(msg, DefaultFullKeyMap.Stop):
+					m.statusMsg = "Stopping container..."
+					return m, tea.Batch(
+						m.containerAction("stop"),
+						func() tea.Msg {
+							return afterActionMsg{action: "inspect"}
+						},
+					)
+				case key.Matches(msg, DefaultFullKeyMap.Restart):
+					m.statusMsg = "Restarting container..."
+					return m, tea.Batch(
+						m.containerAction("restart"),
+						func() tea.Msg {
+							return afterActionMsg{action: "inspect"}
+						},
+					)
+				case key.Matches(msg, DefaultFullKeyMap.Pause):
+					m.statusMsg = "Pausing container..."
+					return m, tea.Batch(
+						m.containerAction("pause"),
+						func() tea.Msg {
+							return afterActionMsg{action: "inspect"}
+						},
+					)
+				case key.Matches(msg, DefaultFullKeyMap.Resume):
+					m.statusMsg = "Unpausing container..."
+					return m, tea.Batch(
+						m.containerAction("unpause"),
+						func() tea.Msg {
+							return afterActionMsg{action: "inspect"}
+						},
+					)
+				case key.Matches(msg, DefaultFullKeyMap.Kill):
+					m.statusMsg = "Killing container..."
+					return m, tea.Batch(
+						m.containerAction("kill"),
+						func() tea.Msg {
+							return afterActionMsg{action: "list"}
+						},
+					)
+				case key.Matches(msg, DefaultFullKeyMap.Remove):
+					m.statusMsg = "Removing container..."
+					return m, tea.Batch(
+						m.containerAction("remove"),
+						func() tea.Msg {
+							return afterActionMsg{action: "list"}
+						},
+					)
+				}
+			case ImagesTab:
+				switch {
+				case key.Matches(msg, DefaultFullKeyMap.Remove):
+					m.statusMsg = "Removing image..."
+					return m, tea.Batch(
+						m.imageAction("remove"),
+						func() tea.Msg {
+							return afterActionMsg{action: "list"}
+						},
+					)
+				}
+			case VolumesTab:
+				switch {
+				case key.Matches(msg, DefaultFullKeyMap.Remove):
+					m.statusMsg = "Removing volume..."
+					return m, tea.Batch(
+						m.volumeAction("remove"),
+						func() tea.Msg {
+							return afterActionMsg{action: "list"}
+						},
+					)
+				}
+			case NetworksTab:
+				switch {
+				case key.Matches(msg, DefaultFullKeyMap.Remove):
+					m.statusMsg = "Removing network..."
+					return m, tea.Batch(
+						m.networkAction("remove"),
+						func() tea.Msg {
+							return afterActionMsg{action: "list"}
+						},
+					)
+				}
 			}
 
 			// When in inspect mode, let the viewport handle navigation
@@ -1063,6 +1502,7 @@ func (m FullModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.imageTable = m.initializeTable(ImagesTab)
 			m.volumeTable = m.initializeTable(VolumesTab)
 			m.networkTable = m.initializeTable(NetworksTab)
+			m.composeTable = m.initializeTable(ComposeTab)
 
 			// Set up viewport for details panel
 			m.viewport = viewport.New(msg.Width, msg.Height-8)
@@ -1070,6 +1510,7 @@ func (m FullModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				BorderStyle(lipgloss.RoundedBorder()).
 				BorderForeground(lipgloss.Color("240")).
 				Padding(1, 2)
+
 		} else {
 			m.updateTables()
 		}
@@ -1163,7 +1604,17 @@ func (m FullModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case fullInspectMsg:
 		m.inspectContent = msg.content
-		m.viewport.SetContent(m.inspectContent)
+
+		// Special handling for Compose tab
+		if m.currentTab == ComposeTab && m.currentMode == InspectMode {
+			// Use our custom compose inspection renderer instead of the generic content
+			content := m.renderComposeInspect()
+			m.viewport.SetContent(content)
+		} else {
+			// Normal handling for other tabs
+			m.viewport.SetContent(m.inspectContent)
+		}
+
 		m.viewport.GotoTop()
 		m.statusMsg = fmt.Sprintf("Inspecting %s", m.selectedName)
 
@@ -1180,6 +1631,8 @@ func (m FullModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.fetchVolumes
 			case NetworksTab:
 				return m, m.fetchNetworks
+			case ComposeTab:
+				return m, m.fetchComposeProjects
 			default:
 				return m, m.fetchContainers
 			}
@@ -1213,13 +1666,86 @@ func (m FullModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Handle actions after a container action completes
 		if msg.action == "inspect" {
 			// Stay in inspect mode and refresh the inspection
+			if m.currentTab == ComposeTab {
+				return m, m.inspectComposeProject
+			}
 			return m, m.inspectResource
 		} else if msg.action == "list" {
 			// Return to list mode
 			m.currentMode = ListMode
-			// Refresh the containers
+			// Refresh the resources
+			if m.currentTab == ComposeTab {
+				return m, m.fetchComposeProjects
+			}
 			return m, m.fetchContainers
 		}
+
+	case composeProjectsMsg:
+		m.loading = false
+		m.composeProjects = msg.projects
+
+		// Convert compose projects to table rows
+		rows := []table.Row{}
+		for _, p := range msg.projects {
+			row := table.Row{p.Name, p.Status, p.Path}
+			rows = append(rows, row)
+		}
+
+		m.composeTable.SetRows(rows)
+		m.statusMsg = fmt.Sprintf("Loaded %d Docker Compose projects", len(msg.projects))
+
+	case fullComposeServicesMsg:
+		m.composeServicesLoading = false
+		m.composeServices = msg.services
+		if msg.error != nil {
+			// Show error in the status bar
+			m.statusMsg = fmt.Sprintf("Error: %v", msg.error)
+		} else {
+			m.statusMsg = fmt.Sprintf("Found %d services for %s", len(msg.services), msg.projectName)
+		}
+
+		// Update the viewport with the new content
+		if m.currentMode == InspectMode && m.currentTab == ComposeTab {
+			// Re-render the content with the updated services
+			content := m.renderComposeInspect()
+			m.viewport.SetContent(content)
+
+			// Preserve scroll position if possible, or go to top if new content
+			if len(m.composeServices) > 0 {
+				// Keep current position if just updating content
+				currentY := m.viewport.YOffset
+				m.viewport.SetYOffset(currentY)
+			} else {
+				// Go to top if first time loading
+				m.viewport.GotoTop()
+			}
+		}
+
+		return m, nil
+
+	case fullComposeContainersMsg:
+		m.composeContainersLoading = false
+		m.composeContainers = msg.containers
+		if msg.error != nil {
+			// Show error in the status bar
+			m.statusMsg = fmt.Sprintf("Error fetching containers: %v", msg.error)
+		} else {
+			m.statusMsg = fmt.Sprintf("Found %d containers for %s", len(msg.containers), msg.projectName)
+		}
+
+		// Update the viewport with the new content
+		if m.currentMode == InspectMode && m.currentTab == ComposeTab {
+			// Re-render the content with the updated containers
+			content := m.renderComposeInspect()
+			m.viewport.SetContent(content)
+
+			// Preserve scroll position if possible
+			currentY := m.viewport.YOffset
+			m.viewport.SetYOffset(currentY)
+		}
+
+		return m, nil
+
 	}
 
 	// Apply any pending commands
@@ -1291,6 +1817,8 @@ func (m FullModel) View() string {
 			} else {
 				sb.WriteString(m.networkTable.View())
 			}
+		case ComposeTab:
+			sb.WriteString(m.renderComposeTab())
 		}
 	case InspectMode:
 		// Render inspect view
@@ -1363,6 +1891,7 @@ func (m FullModel) renderTabBar() string {
 		IconImage + "Images",
 		IconVolume + "Volumes",
 		IconNetwork + "Networks",
+		IconCompose + "Compose",
 	}
 
 	var renderedTabs []string
@@ -1412,13 +1941,20 @@ func (m FullModel) renderHelp() string {
 		IconInspect, IconLogs, IconMonitor, IconBack))
 	sb.WriteString("\n\n")
 
-	// Container actions
-	if m.currentTab == ContainersTab {
+	// Tab-specific actions
+	switch m.currentTab {
+	case ContainersTab:
 		sb.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("#5f87ff")).
 			Render("Container Actions:"))
 		sb.WriteString("\n")
 		sb.WriteString(fmt.Sprintf("  %sStart, %sStop, %sRestart, %sPause, %sUnpause, %sKill, %sRemove",
 			IconStart, IconStop, IconRestart, IconPause, IconUnpause, IconKill, IconRemove))
+	case ComposeTab:
+		sb.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("#5f87ff")).
+			Render("Compose Actions:"))
+		sb.WriteString("\n")
+		sb.WriteString(fmt.Sprintf("  %sUp, %sDown, %sPull, %sLogs",
+			IconStart, IconStop, IconRefresh, IconLogs))
 	}
 
 	return sb.String()
@@ -1464,6 +2000,11 @@ func (m FullModel) renderActionPanel() string {
 		actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Remove [d]", IconRemove)))
 	case NetworksTab:
 		actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Remove [d]", IconRemove)))
+	case ComposeTab:
+		actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Up [u]", IconStart)))
+		actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Down [d]", IconStop)))
+		actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Pull [p]", IconRefresh)))
+		actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Logs [l]", IconLogs)))
 	}
 
 	// Render the action buttons in a row
@@ -1546,4 +2087,191 @@ type connectionCheckTickMsg struct{}
 // New message type for handling after-action state changes
 type afterActionMsg struct {
 	action string // "inspect" or "list"
+}
+
+type composeProjectsMsg struct {
+	projects []docker.ComposeInfo
+}
+
+type composeServicesMsg []docker.ComposeServiceInfo
+
+// Define the message type for compose services
+type fullComposeServicesMsg struct {
+	services    []docker.ComposeServiceInfo
+	projectName string
+	error       error
+}
+
+// Define a message type for compose containers
+type fullComposeContainersMsg struct {
+	containers  []docker.ContainerInfo
+	projectName string
+	error       error
+}
+
+// Update the renderComposeTab method to handle cases where no projects are found
+func (m *FullModel) renderComposeTab() string {
+	if m.loading && m.composeTable.Width() == 0 {
+		return "Loading Docker Compose projects..."
+	}
+
+	if m.currentMode == InspectMode {
+		return m.renderComposeInspect()
+	}
+
+	// If no projects are found, show a helpful message
+	if len(m.composeProjects) == 0 {
+		helpStyle := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#5f87ff")).
+			Bold(true).
+			Padding(1)
+
+		infoStyle := lipgloss.NewStyle().
+			Padding(1)
+
+		var sb strings.Builder
+		sb.WriteString(helpStyle.Render("No Docker Compose projects found"))
+		sb.WriteString("\n\n")
+		sb.WriteString(infoStyle.Render("Possible reasons:"))
+		sb.WriteString("\n")
+		sb.WriteString(infoStyle.Render("1. You don't have any Docker Compose projects running"))
+		sb.WriteString("\n")
+		sb.WriteString(infoStyle.Render("2. Docker Compose is not installed or not in your PATH"))
+		sb.WriteString("\n")
+		sb.WriteString(infoStyle.Render("3. Your Docker Compose version might not support the 'ls' command"))
+		sb.WriteString("\n\n")
+		sb.WriteString(infoStyle.Render("Try running 'docker compose ls' in your terminal to verify."))
+
+		return sb.String()
+	}
+
+	return m.composeTable.View()
+}
+
+// renderComposeInspect renders the compose inspection view in a fancy style
+func (m *FullModel) renderComposeInspect() string {
+	content, updatedContainers := views.ComposeInspect(
+		m.selectedName,
+		m.selectedPath,
+		m.selectedProject,
+		m.selectedProjectPath,
+		m.inspectContent,
+		m.composeServicesLoading,
+		m.composeServices,
+		m.composeContainers,
+		m.composeContainersLoading,
+		m.containers,
+		m.viewport.Width,
+		m.viewport.Height,
+		m.ctx,
+		m.docker,
+	)
+
+	// Update the composeContainers with the potentially modified containers
+	if len(updatedContainers) > 0 && len(m.composeContainers) == 0 {
+		m.composeContainers = updatedContainers
+		m.statusMsg = fmt.Sprintf("Found %d containers for project %s", len(updatedContainers), m.selectedName)
+	}
+
+	return content
+}
+
+// fetchComposeContainers fetches containers for a Docker Compose project
+func (m FullModel) fetchComposeContainers() tea.Msg {
+	if m.selectedName == "" {
+		return fullComposeContainersMsg{
+			containers:  []docker.ContainerInfo{},
+			projectName: "",
+			error:       fmt.Errorf("no project selected"),
+		}
+	}
+
+	composeContainers, err := views.FetchComposeContainers(m.ctx, m.docker, m.selectedName)
+
+	if err != nil {
+		return fullComposeContainersMsg{
+			containers:  []docker.ContainerInfo{},
+			projectName: m.selectedName,
+			error:       err,
+		}
+	}
+
+	// Return the result
+	return fullComposeContainersMsg{
+		containers:  composeContainers,
+		projectName: m.selectedName,
+	}
+}
+
+// Helper function to jump to a specific container
+func (m *FullModel) jumpToContainer(id string) {
+	// First, refresh the container list to ensure we have the latest data
+	containers, err := m.docker.ListContainers(m.ctx, true)
+	if err == nil {
+		m.containers = containers
+	}
+
+	// Switch to Containers tab
+	m.currentTab = ContainersTab
+	m.currentMode = ListMode
+
+	// Find the container in the list and select it
+	foundIndex := -1
+
+	// First try exact ID match
+	for i, container := range m.containers {
+		if strings.HasPrefix(container.ID, id) {
+			foundIndex = i
+			break
+		}
+	}
+
+	// If not found by ID, try name match (for cases where the ID in compose view might be different)
+	if foundIndex == -1 && len(m.composeContainers) > 0 {
+		// Find the container name from composeContainers
+		var containerName string
+		for _, c := range m.composeContainers {
+			if strings.HasPrefix(c.ID, id) {
+				containerName = c.Name
+				// Handle service name in parentheses
+				if idx := strings.Index(containerName, " ("); idx > 0 {
+					containerName = containerName[:idx]
+				}
+				break
+			}
+		}
+
+		// If we found a name, look for it in the main containers list
+		if containerName != "" {
+			for i, container := range m.containers {
+				// Some container names have a leading slash that needs to be trimmed
+				name := strings.TrimPrefix(container.Name, "/")
+				if name == containerName {
+					foundIndex = i
+					break
+				}
+			}
+		}
+	}
+
+	// If still not found, try a more fuzzy matching approach with container IDs
+	if foundIndex == -1 {
+		// Try matching just the first few characters of the ID
+		for i, container := range m.containers {
+			if len(id) >= 6 && len(container.ID) >= 6 &&
+				strings.EqualFold(container.ID[:6], id[:6]) {
+				foundIndex = i
+				break
+			}
+		}
+	}
+
+	// If found, update the cursor position in the container table
+	if foundIndex >= 0 {
+		m.containerTable.SetCursor(foundIndex)
+		m.updateSelection()
+		m.statusMsg = fmt.Sprintf("Selected container: %s", m.containers[foundIndex].Name)
+	} else {
+		m.statusMsg = fmt.Sprintf("Container not found in main list. Try refreshing.")
+	}
 }
