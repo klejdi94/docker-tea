@@ -32,6 +32,7 @@ Docker Tea is a modern terminal-based UI for Docker management. It provides a cl
 
 - Go 1.18 or higher
 - Docker installed and running
+- Make (optional, for using Makefile)
 
 ### Build from Source
 
@@ -43,12 +44,26 @@ Docker Tea is a modern terminal-based UI for Docker management. It provides a cl
 
 2. Build and run the application:
 
-   **For Windows:**
+   **Using Makefile (recommended):**
+   ```
+   # Build the application
+   make build
+
+   # Build and run the application
+   make run
+
+   # Show all available commands
+   make help
+   ```
+
+   **Using Scripts:**
+
+   For Windows:
    ```
    .\scripts\run.bat
    ```
 
-   **For Linux/macOS:**
+   For Linux/macOS:
    ```
    chmod +x ./scripts/run.sh
    ./scripts/run.sh
@@ -100,11 +115,19 @@ Docker Tea is a modern terminal-based UI for Docker management. It provides a cl
 - `scripts/`: Build and run scripts
   - `run.bat`: Windows script
   - `run.sh`: Linux/macOS script
+- `Makefile`: Build automation
 
 ### Building for Development
 
 ```
+# Using Go directly
 go build -o docker-tea ./cmd/docker-tea
+
+# Using Make
+make build
+
+# Build for multiple platforms
+make build-all
 ```
 
 ## 📜 License

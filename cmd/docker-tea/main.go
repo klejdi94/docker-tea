@@ -13,6 +13,12 @@ import (
 	"github.com/klejdi94/docker-tea/internal/ui"
 )
 
+// Version information - set via build flags
+var (
+	Version   = "dev"
+	BuildTime = "unknown"
+)
+
 func main() {
 	// Create a cancellable context for the app
 	ctx, cancel := context.WithCancel(context.Background())

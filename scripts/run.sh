@@ -2,11 +2,18 @@
 
 echo "Building Docker Tea application..."
 
+# Save current directory and navigate to project root
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+PROJECT_ROOT="$( cd "$SCRIPT_DIR/.." && pwd )"
+cd "$PROJECT_ROOT"
+
 # Build the application
 go build -o docker-tea ./cmd/docker-tea
 
 if [ $? -ne 0 ]; then
     echo "Failed to build Docker Tea application"
+    # Return to the original directory
+    cd - > /dev/null
     exit 1
 fi
 
@@ -22,4 +29,7 @@ echo ""
 chmod +x ./docker-tea
 
 # Run the application
-./docker-tea 
+./docker-tea
+
+# Return to the original directory
+cd - > /dev/null 
