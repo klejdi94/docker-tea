@@ -2150,7 +2150,7 @@ func (m *FullModel) renderComposeTab() string {
 
 // renderComposeInspect renders the compose inspection view in a fancy style
 func (m *FullModel) renderComposeInspect() string {
-	return views.ComposeInspect(
+	content, updatedContainers := views.ComposeInspect(
 		m.selectedName,
 		m.selectedPath,
 		m.selectedProject,
@@ -2166,6 +2166,14 @@ func (m *FullModel) renderComposeInspect() string {
 		m.ctx,
 		m.docker,
 	)
+
+	// Update the composeContainers with the potentially modified containers
+	if len(updatedContainers) > 0 && len(m.composeContainers) == 0 {
+		m.composeContainers = updatedContainers
+		m.statusMsg = fmt.Sprintf("Found %d containers for project %s", len(updatedContainers), m.selectedName)
+	}
+
+	return content
 }
 
 // fetchComposeContainers fetches containers for a Docker Compose project
