@@ -23,9 +23,9 @@ func ComposeInspect(
 	viewportWidth, viewportHeight int,
 	ctx context.Context,
 	dockerService *docker.Service,
-) string {
+) (string, []docker.ContainerInfo) {
 	if composeServicesLoading {
-		return "Loading compose services..."
+		return "Loading compose services...", composeContainers
 	}
 
 	// StringBuilder for building the full UI
@@ -446,7 +446,7 @@ func ComposeInspect(
 		sb.WriteString(inspectContent)
 	}
 
-	return sb.String()
+	return sb.String(), tmpComposeContainers
 }
 
 // FetchComposeContainers finds containers belonging to a compose project
