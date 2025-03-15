@@ -58,6 +58,9 @@ func main() {
 		tea.WithMouseCellMotion(),
 	)
 
+	// Set up Docker event listener
+	ui.SetupEventListener(ctx, dockerService, p)
+
 	// Run the program
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Error running program: %v\n", err)

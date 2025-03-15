@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -130,6 +131,33 @@ type ComposeServiceInfo struct {
 	CPU         float64  `json:"cpu"`
 	Memory      int64    `json:"memory"`
 	MemoryLimit int64    `json:"memoryLimit"`
+}
+
+// DockerEvent represents a simplified Docker event
+type DockerEvent struct {
+	Type     string
+	Action   string
+	ID       string
+	Time     time.Time
+	Resource string
+}
+
+// EventCallback is a function type that gets called when a Docker event occurs
+type EventCallback func(DockerEvent)
+
+// SystemInfo represents Docker system information
+type SystemInfo struct {
+	Containers        int
+	ContainersRunning int
+	ContainersPaused  int
+	ContainersStopped int
+	Images            int
+	Volumes           int
+	Networks          int
+	CPUUsage          float64
+	MemoryUsage       int64
+	MemoryLimit       int64
+	MemoryPercentage  float64
 }
 
 // NewService creates a new Docker service with a given client
@@ -1031,6 +1059,163 @@ func (s *Service) ComposeConfig(ctx context.Context, projectPath string) (string
 	return string(output), nil
 }
 
+// FetchComposeServiceDetails retrieves detailed information about Docker Compose services
+// including their current status, resource usage, and connected containers
+func (s *Service) FetchComposeServiceDetails(ctx context.Context, projectPath string, serviceName string) (*ComposeServiceInfo, error) {
+	// Validate inputs
+	if projectPath == "" {
+		return nil, fmt.Errorf("project path is required")
+	}
+
+	// Try to get service details from the compose config
+	configCmd := exec.Command("docker", "compose", "--project-directory", projectPath, "config", "--services")
+	configOutput, err := configCmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get service config: %v", err)
+	}
+
+	// Check if service exists in this project
+	serviceFound := false
+	services := strings.Split(strings.TrimSpace(string(configOutput)), "\n")
+	for _, svc := range services {
+		if svc == serviceName {
+			serviceFound = true
+			break
+		}
+	}
+
+	if !serviceFound {
+		return nil, fmt.Errorf("service %s not found in project", serviceName)
+	}
+
+	// Get detailed config for this service
+	detailCmd := exec.Command("docker", "compose", "--project-directory", projectPath, "ps", serviceName, "--format", "json")
+	detailOutput, err := detailCmd.CombinedOutput()
+	if err != nil {
+		// If the JSON format fails, try regular output
+		detailCmd = exec.Command("docker", "compose", "--project-directory", projectPath, "ps", serviceName)
+		detailOutput, err = detailCmd.CombinedOutput()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get service details: %v", err)
+		}
+	}
+
+	// Try to parse as JSON first
+	var serviceDetails []map[string]interface{}
+	var containerIDs []string
+	status := "unknown"
+
+	if json.Unmarshal(detailOutput, &serviceDetails) == nil && len(serviceDetails) > 0 {
+		// We have service details in JSON format
+		for _, detail := range serviceDetails {
+			if id, ok := detail["ID"].(string); ok {
+				containerIDs = append(containerIDs, id)
+			}
+			if state, ok := detail["State"].(string); ok {
+				status = state
+			}
+		}
+	} else {
+		// Parse text output
+		lines := strings.Split(string(detailOutput), "\n")
+		for i, line := range lines {
+			// Skip header line
+			if i == 0 || strings.TrimSpace(line) == "" {
+				continue
+			}
+
+			parts := strings.Fields(line)
+			if len(parts) >= 2 {
+				// First field is usually container ID
+				containerIDs = append(containerIDs, parts[0])
+
+				// Try to determine status from later fields
+				for _, part := range parts {
+					lpart := strings.ToLower(part)
+					if strings.Contains(lpart, "up") || strings.Contains(lpart, "running") {
+						status = "running"
+						break
+					} else if strings.Contains(lpart, "exit") || strings.Contains(lpart, "stop") {
+						status = "stopped"
+						break
+					}
+				}
+			}
+		}
+	}
+
+	// Get image information from config
+	imageCmd := exec.Command("docker", "compose", "--project-directory", projectPath, "config", "--format", "json")
+	imageOutput, err := imageCmd.CombinedOutput()
+
+	var image string
+	var ports []string
+
+	if err == nil {
+		var config map[string]interface{}
+		if json.Unmarshal(imageOutput, &config) == nil {
+			if services, ok := config["services"].(map[string]interface{}); ok {
+				if service, ok := services[serviceName].(map[string]interface{}); ok {
+					if img, ok := service["image"].(string); ok {
+						image = img
+					}
+
+					// Extract ports
+					if portsConfig, ok := service["ports"].([]interface{}); ok {
+						for _, p := range portsConfig {
+							if portStr, ok := p.(string); ok {
+								ports = append(ports, portStr)
+							} else if portMap, ok := p.(map[string]interface{}); ok {
+								// Handle complex port mapping
+								published, hasPublished := portMap["published"]
+								target, hasTarget := portMap["target"]
+								if hasPublished && hasTarget {
+									ports = append(ports, fmt.Sprintf("%v:%v", published, target))
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// If we couldn't get the image from config, try to extract it from containers
+	if image == "" && len(containerIDs) > 0 {
+		// Get the first container's details
+		container, err := s.client.ContainerInspect(ctx, containerIDs[0])
+		if err == nil {
+			image = container.Config.Image
+		}
+	}
+
+	// Calculate total CPU and memory for all containers
+	var totalCPU float64
+	var totalMemory, totalMemoryLimit int64
+
+	for _, id := range containerIDs {
+		if stats, err := s.GetProcessedStats(ctx, id); err == nil {
+			totalCPU += stats.CPUPercentage
+			totalMemory += stats.MemoryUsage
+			if stats.MemoryLimit > totalMemoryLimit {
+				totalMemoryLimit = stats.MemoryLimit
+			}
+		}
+	}
+
+	// Return the composite service info
+	return &ComposeServiceInfo{
+		Name:        serviceName,
+		Status:      status,
+		Image:       image,
+		Ports:       ports,
+		Containers:  containerIDs,
+		CPU:         totalCPU,
+		Memory:      totalMemory,
+		MemoryLimit: totalMemoryLimit,
+	}, nil
+}
+
 // InspectComposeProject returns information about a Docker Compose project
 func (s *Service) InspectComposeProject(ctx context.Context, projectPath string) (string, error) {
 	var result string
@@ -1548,4 +1733,211 @@ func (s *Service) addTestContainers(projectName string) []ContainerInfo {
 	})
 
 	return containerInfos
+}
+
+// SubscribeToEvents subscribes to Docker API events and calls the provided callback
+// function when events occur. This function blocks until the context is canceled.
+func (s *Service) SubscribeToEvents(ctx context.Context, callback EventCallback) error {
+	// For now, we'll implement a simple polling mechanism
+	// instead of using the event stream directly due to API compatibility issues
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	var lastContainerIDs []string
+	var lastImageIDs []string
+	var lastVolumeNames []string
+	var lastNetworkIDs []string
+
+	// Main loop
+	for {
+		select {
+		case <-ticker.C:
+			// Check for container changes
+			containers, err := s.ListContainers(ctx, true)
+			if err == nil {
+				currentIDs := make([]string, len(containers))
+				for i, c := range containers {
+					currentIDs[i] = c.ID
+				}
+
+				// If this is not the first check and the list has changed
+				if len(lastContainerIDs) > 0 && !stringSlicesEqual(lastContainerIDs, currentIDs) {
+					callback(DockerEvent{
+						Type:   "container",
+						Action: "update",
+						Time:   time.Now(),
+					})
+				}
+
+				lastContainerIDs = currentIDs
+			}
+
+			// Check for image changes
+			images, err := s.ListImages(ctx)
+			if err == nil {
+				currentIDs := make([]string, len(images))
+				for i, img := range images {
+					currentIDs[i] = img.ID
+				}
+
+				// If this is not the first check and the list has changed
+				if len(lastImageIDs) > 0 && !stringSlicesEqual(lastImageIDs, currentIDs) {
+					callback(DockerEvent{
+						Type:   "image",
+						Action: "update",
+						Time:   time.Now(),
+					})
+				}
+
+				lastImageIDs = currentIDs
+			}
+
+			// Check for volume changes
+			volumes, err := s.ListVolumes(ctx)
+			if err == nil {
+				currentNames := make([]string, len(volumes))
+				for i, vol := range volumes {
+					currentNames[i] = vol.Name
+				}
+
+				// If this is not the first check and the list has changed
+				if len(lastVolumeNames) > 0 && !stringSlicesEqual(lastVolumeNames, currentNames) {
+					callback(DockerEvent{
+						Type:   "volume",
+						Action: "update",
+						Time:   time.Now(),
+					})
+				}
+
+				lastVolumeNames = currentNames
+			}
+
+			// Check for network changes
+			networks, err := s.ListNetworks(ctx)
+			if err == nil {
+				currentIDs := make([]string, len(networks))
+				for i, nw := range networks {
+					currentIDs[i] = nw.ID
+				}
+
+				// If this is not the first check and the list has changed
+				if len(lastNetworkIDs) > 0 && !stringSlicesEqual(lastNetworkIDs, currentIDs) {
+					callback(DockerEvent{
+						Type:   "network",
+						Action: "update",
+						Time:   time.Now(),
+					})
+				}
+
+				lastNetworkIDs = currentIDs
+			}
+
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// Helper function to compare two string slices
+func stringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+
+	// Create maps for quick lookups
+	mapA := make(map[string]bool, len(a))
+	for _, str := range a {
+		mapA[str] = true
+	}
+
+	// Check if all elements in b are in a
+	for _, str := range b {
+		if !mapA[str] {
+			return false
+		}
+	}
+
+	return true
+}
+
+// ComposeServiceAction performs an action on a specific Docker Compose service
+func (s *Service) ComposeServiceAction(ctx context.Context, projectPath string, serviceName string, action string) error {
+	// Validate inputs
+	if projectPath == "" {
+		return fmt.Errorf("project path is required")
+	}
+	if serviceName == "" {
+		return fmt.Errorf("service name is required")
+	}
+
+	// Map the action to a Docker Compose command
+	var cmd *exec.Cmd
+	switch strings.ToLower(action) {
+	case "up", "start":
+		cmd = exec.Command("docker", "compose", "--project-directory", projectPath, "up", "-d", serviceName)
+	case "down", "stop":
+		cmd = exec.Command("docker", "compose", "--project-directory", projectPath, "stop", serviceName)
+	case "restart":
+		cmd = exec.Command("docker", "compose", "--project-directory", projectPath, "restart", serviceName)
+	case "pull":
+		cmd = exec.Command("docker", "compose", "--project-directory", projectPath, "pull", serviceName)
+	case "logs":
+		cmd = exec.Command("docker", "compose", "--project-directory", projectPath, "logs", serviceName)
+	case "ps":
+		cmd = exec.Command("docker", "compose", "--project-directory", projectPath, "ps", serviceName)
+	default:
+		return fmt.Errorf("unsupported action: %s", action)
+	}
+
+	// Execute the command
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to perform %s on service %s: %v\n%s", action, serviceName, err, string(output))
+	}
+
+	return nil
+}
+
+// GetSystemInfo returns system-wide Docker information
+func (s *Service) GetSystemInfo(ctx context.Context) (SystemInfo, error) {
+	info, err := s.client.Info(ctx)
+	if err != nil {
+		return SystemInfo{}, err
+	}
+
+	// Get container counts
+	systemInfo := SystemInfo{
+		Containers:        info.Containers,
+		ContainersRunning: info.ContainersRunning,
+		ContainersPaused:  info.ContainersPaused,
+		ContainersStopped: info.ContainersStopped,
+		Images:            info.Images,
+	}
+
+	// Get network count
+	networks, err := s.client.NetworkList(ctx, network.ListOptions{})
+	if err == nil {
+		systemInfo.Networks = len(networks)
+	}
+
+	// Get volume count
+	volumes, err := s.client.VolumeList(ctx, volume.ListOptions{Filters: filters.Args{}})
+	if err == nil {
+		systemInfo.Volumes = len(volumes.Volumes)
+	}
+
+	// Get host memory usage - this is an approximation
+	var memStats runtime.MemStats
+	runtime.ReadMemStats(&memStats)
+	systemInfo.MemoryUsage = int64(memStats.Alloc)
+	systemInfo.MemoryLimit = int64(memStats.Sys)
+	if systemInfo.MemoryLimit > 0 {
+		systemInfo.MemoryPercentage = float64(systemInfo.MemoryUsage) / float64(systemInfo.MemoryLimit) * 100
+	}
+
+	// Note: Getting host CPU usage accurately would require additional OS-specific code
+	// This is just a placeholder that would need to be implemented properly
+	systemInfo.CPUUsage = 0
+
+	return systemInfo, nil
 }

@@ -81,6 +81,7 @@ const (
 	InspectMode
 	LogsMode
 	MonitorMode
+	ComposeServiceMode // New mode for viewing individual compose services
 )
 
 // FullModel represents the complete Bubble Tea model for Docker TUI
@@ -123,6 +124,8 @@ type FullModel struct {
 	spinner                  spinner.Model
 	composeContainers        []docker.ContainerInfo
 	composeContainersLoading bool
+	systemInfo               docker.SystemInfo
+	systemInfoLoading        bool
 }
 
 // FullKeyMap defines the keybindings for the application
@@ -344,14 +347,19 @@ func NewFullModel(dockerService *docker.Service, config *config.Config, ctx cont
 
 // Init initializes the model
 func (m FullModel) Init() tea.Cmd {
-	return tea.Batch(
+	// Start loading data
+	cmds := []tea.Cmd{
 		m.checkDockerConnection,
 		m.fetchContainers,
 		m.fetchImages,
 		m.fetchVolumes,
 		m.fetchNetworks,
 		m.fetchComposeProjects,
-	)
+		func() tea.Msg {
+			return m.fetchSystemInfo()
+		},
+	}
+	return tea.Batch(cmds...)
 }
 
 // checkDockerConnection verifies Docker is running
@@ -1492,6 +1500,13 @@ func (m FullModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.startStatsRefresh())
 		}
 
+		// Refresh system info every 5 seconds
+		if time.Now().Second()%5 == 0 {
+			cmds = append(cmds, func() tea.Msg {
+				return m.fetchSystemInfo()
+			})
+		}
+
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
@@ -1746,6 +1761,43 @@ func (m FullModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		return m, nil
 
+	case composeListMsg:
+		m.composeProjects = msg.projects
+		m.currentTab = ComposeTab
+		m.currentMode = ListMode
+		// Instead of using m.listTable, we'll update the UI through the table model
+		m.composeTable = buildComposeTableModel(m.composeProjects, m.width)
+		return m, nil
+
+	// Add handling for Docker Compose service actions
+	case composeServiceActionMsg:
+		return m, m.composeServiceAction(msg.serviceName, msg.action)
+
+	// Add handling for viewing Docker Compose service details
+	case composeServiceViewMsg:
+		return m, m.viewComposeService(msg.serviceName)
+
+	case errorMsg:
+		m.loading = false
+		m.err = msg.err
+		m.statusMsg = fmt.Sprintf("Error: %v", msg.err)
+
+	case fullSystemInfoMsg:
+		m.systemInfo = msg.info
+		m.systemInfoLoading = false
+		// Don't set status message for system info updates to keep the UI clean
+		// Instead, let the footer display the stats
+
+		// Schedule a message cleanup after a few seconds if there was a previous message
+		if m.statusMsg != "" {
+			cmds = append(cmds, tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
+				return statusClearMsg{}
+			}))
+		}
+
+	case statusClearMsg:
+		m.statusMsg = ""
+
 	}
 
 	// Apply any pending commands
@@ -1864,10 +1916,53 @@ func (m FullModel) View() string {
 		sb.WriteString(monitorHeader)
 		sb.WriteString("\n\n")
 		sb.WriteString(m.viewport.View())
+	case ComposeServiceMode:
+		// Render Docker Compose service view
+		serviceHeader := lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("#88c0d0")).
+			Render(fmt.Sprintf("Docker Compose Service: %s", m.selectedName))
+
+		sb.WriteString(serviceHeader)
+		sb.WriteString("\n\n")
+
+		// Calculate available height for the viewport to leave room for action panel
+		serviceHeight := m.height - 16 // Leave space for header, footer, and action panel
+
+		// Adjust viewport height if needed
+		if m.viewport.Height != serviceHeight {
+			m.viewport.Height = serviceHeight
+		}
+
+		sb.WriteString(m.viewport.View())
+
+		// Add action panel after the viewport
+		sb.WriteString("\n\n")
+		sb.WriteString(m.renderActionPanel())
 	}
 
 	// Footer with status and help
-	footerText := fmt.Sprintf("%s | Press ? for help", m.statusMsg)
+	var footerText string
+	if m.dockerConnected {
+		// Display Docker stats in footer
+		containerStats := fmt.Sprintf("🐳 %d/%d/%d", m.systemInfo.ContainersRunning, m.systemInfo.ContainersPaused, m.systemInfo.ContainersStopped)
+		resourceStats := fmt.Sprintf("📦 %d | 💾 %d | 🌐 %d", m.systemInfo.Images, m.systemInfo.Volumes, m.systemInfo.Networks)
+
+		// Format memory usage if available
+		memoryStats := ""
+		if m.systemInfo.MemoryLimit > 0 {
+			memoryStats = fmt.Sprintf(" | 🧠 %s (%.1f%%)", formatBytes(m.systemInfo.MemoryUsage), m.systemInfo.MemoryPercentage)
+		}
+
+		footerText = fmt.Sprintf("%s | %s%s | %s", containerStats, resourceStats, memoryStats, m.statusMsg)
+	} else {
+		footerText = m.statusMsg
+	}
+
+	// Add help hint
+	footerText = fmt.Sprintf("%s | Press ? for help", footerText)
+
+	// Style and render footer
 	footer := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("#4c566a")).
 		Render(footerText)
@@ -1941,6 +2036,15 @@ func (m FullModel) renderHelp() string {
 		IconInspect, IconLogs, IconMonitor, IconBack))
 	sb.WriteString("\n\n")
 
+	// Footer legend
+	sb.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("#5f87ff")).
+		Render("Footer Stats Legend:"))
+	sb.WriteString("\n")
+	sb.WriteString(fmt.Sprintf("  %s Running/Paused/Stopped containers", IconContainer))
+	sb.WriteString("\n")
+	sb.WriteString(fmt.Sprintf("  %s Images | %s Volumes | %s Networks", IconImage, IconVolume, IconNetwork))
+	sb.WriteString("\n\n")
+
 	// Tab-specific actions
 	switch m.currentTab {
 	case ContainersTab:
@@ -1985,26 +2089,46 @@ func (m FullModel) renderActionPanel() string {
 	actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Refresh [r]", IconRefresh)))
 	actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Back [Esc]", IconBack)))
 
+	// Remove the early return for ComposeServiceMode
+	// if m.currentMode == ComposeServiceMode {
+	//	// Actions for individual Docker Compose services
+	//	actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Up [u]", IconStart)))
+	//	actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Down [d]", IconStop)))
+	//	actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Restart [R]", IconRestart)))
+	//	actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Pull [p]", IconRefresh)))
+	//	actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Logs [l]", IconLogs)))
+	//	return boxStyle.Render(sb.String())
+	// }
+
 	// Tab-specific actions
-	switch m.currentTab {
-	case ContainersTab:
-		actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Start [s]", IconStart)))
-		actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Stop [S]", IconStop)))
-		actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Restart [R]", IconRestart)))
-		actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Logs [l]", IconLogs)))
-		actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Monitor [m]", IconMonitor)))
-		actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Remove [d]", IconRemove)))
-	case ImagesTab:
-		actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Remove [d]", IconRemove)))
-	case VolumesTab:
-		actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Remove [d]", IconRemove)))
-	case NetworksTab:
-		actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Remove [d]", IconRemove)))
-	case ComposeTab:
+	if m.currentMode == ComposeServiceMode {
+		// Actions for individual Docker Compose services
 		actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Up [u]", IconStart)))
 		actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Down [d]", IconStop)))
+		actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Restart [R]", IconRestart)))
 		actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Pull [p]", IconRefresh)))
 		actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Logs [l]", IconLogs)))
+	} else {
+		switch m.currentTab {
+		case ContainersTab:
+			actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Start [s]", IconStart)))
+			actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Stop [S]", IconStop)))
+			actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Restart [R]", IconRestart)))
+			actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Logs [l]", IconLogs)))
+			actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Monitor [m]", IconMonitor)))
+			actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Remove [d]", IconRemove)))
+		case ImagesTab:
+			actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Remove [d]", IconRemove)))
+		case VolumesTab:
+			actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Remove [d]", IconRemove)))
+		case NetworksTab:
+			actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Remove [d]", IconRemove)))
+		case ComposeTab:
+			actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Up [u]", IconStart)))
+			actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Down [d]", IconStop)))
+			actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Pull [p]", IconRefresh)))
+			actions = append(actions, actionStyle.Render(fmt.Sprintf("%s Logs [l]", IconLogs)))
+		}
 	}
 
 	// Render the action buttons in a row
@@ -2275,3 +2399,221 @@ func (m *FullModel) jumpToContainer(id string) {
 		m.statusMsg = fmt.Sprintf("Container not found in main list. Try refreshing.")
 	}
 }
+
+// Add a new method to handle Docker Compose service actions
+func (m FullModel) composeServiceAction(serviceName, action string) tea.Cmd {
+	// Validate that we have a project path and service name
+	if m.selectedProjectPath == "" {
+		return func() tea.Msg {
+			return fullActionResultMsg{
+				success: false,
+				message: "No Docker Compose project path selected",
+				action:  action,
+			}
+		}
+	}
+
+	if serviceName == "" {
+		return func() tea.Msg {
+			return fullActionResultMsg{
+				success: false,
+				message: "No Docker Compose service selected",
+				action:  action,
+			}
+		}
+	}
+
+	return func() tea.Msg {
+		// Create a context with timeout
+		ctx, cancel := context.WithTimeout(m.ctx, 30*time.Second)
+		defer cancel()
+
+		// Set status message
+		var verb string
+		switch action {
+		case "up":
+			verb = "starting"
+		case "down":
+			verb = "stopping"
+		case "restart":
+			verb = "restarting"
+		case "pull":
+			verb = "pulling"
+		default:
+			verb = action + "ing"
+		}
+
+		m.statusMsg = fmt.Sprintf("%s Docker Compose service: %s", verb, serviceName)
+
+		// Perform the action
+		err := m.docker.ComposeServiceAction(ctx, m.selectedProjectPath, serviceName, action)
+		if err != nil {
+			return fullActionResultMsg{
+				success: false,
+				message: fmt.Sprintf("Error %s service %s: %v", verb, serviceName, err),
+				action:  action,
+			}
+		}
+
+		return fullActionResultMsg{
+			success: true,
+			message: fmt.Sprintf("Successfully %s service %s", verb, serviceName),
+			action:  action,
+		}
+	}
+}
+
+// Add a method to view details for a specific Docker Compose service
+func (m FullModel) viewComposeService(serviceName string) tea.Cmd {
+	return func() tea.Msg {
+		// Create a context with timeout
+		ctx, cancel := context.WithTimeout(m.ctx, 10*time.Second)
+		defer cancel()
+
+		// Change to ComposeServiceMode and set the selected service
+		m.currentMode = ComposeServiceMode
+		m.selectedName = serviceName
+
+		// Get the service details
+		serviceView := views.ComposeServiceDetails(
+			ctx,
+			m.docker,
+			m.selectedProjectPath,
+			serviceName,
+			m.width,
+		)
+
+		// Return the content as an inspect message
+		return fullInspectMsg{
+			content: serviceView,
+		}
+	}
+}
+
+// Add message types for Docker Compose actions
+type composeListMsg struct {
+	projects []docker.ComposeInfo
+}
+
+type composeServiceActionMsg struct {
+	serviceName string
+	action      string
+}
+
+type composeServiceViewMsg struct {
+	serviceName string
+}
+
+// Add a helper function to build the compose table model
+func buildComposeTableModel(projects []docker.ComposeInfo, width int) table.Model {
+	// Define columns for the table
+	columns := []table.Column{
+		{Title: "Name", Width: width / 5},
+		{Title: "Path", Width: width / 5},
+		{Title: "Services", Width: width / 10},
+		{Title: "Status", Width: width / 10},
+		{Title: "Config Files", Width: width / 3},
+	}
+
+	// Create rows for each project
+	var rows []table.Row
+	for _, project := range projects {
+		rows = append(rows, table.Row{
+			project.Name,
+			project.Path,
+			fmt.Sprintf("%d", len(project.Services)),
+			project.Status,
+			project.ConfigFiles,
+		})
+	}
+
+	// Create and style the table
+	t := table.New(
+		table.WithColumns(columns),
+		table.WithRows(rows),
+		table.WithFocused(true),
+		table.WithHeight(len(rows)),
+	)
+
+	// Define table styles
+	s := table.DefaultStyles()
+	s.Header = s.Header.
+		BorderStyle(lipgloss.NormalBorder()).
+		BorderForeground(lipgloss.Color("240")).
+		BorderBottom(true).
+		Bold(true)
+	s.Selected = s.Selected.
+		Foreground(lipgloss.Color("229")).
+		Background(lipgloss.Color("57")).
+		Bold(true)
+	t.SetStyles(s)
+
+	return t
+}
+
+// Add a helper function to build the compose table
+func buildComposeTable(projects []docker.ComposeInfo, width int) string {
+	if len(projects) == 0 {
+		return "No Docker Compose projects found"
+	}
+
+	var sb strings.Builder
+
+	// Create the table header
+	sb.WriteString("NAME | PATH | SERVICES | STATUS | CONFIG FILES\n")
+	sb.WriteString("-------------------------------------------------\n")
+
+	// Add each project to the table
+	for _, project := range projects {
+		sb.WriteString(fmt.Sprintf(
+			"%s | %s | %d | %s | %s\n",
+			project.Name,
+			project.Path,
+			len(project.Services),
+			project.Status,
+			project.ConfigFiles,
+		))
+	}
+
+	return sb.String()
+}
+
+// Add a method to fetch the list of Docker Compose projects
+func (m FullModel) fetchComposeList() tea.Cmd {
+	return func() tea.Msg {
+		// Create a context with timeout
+		ctx, cancel := context.WithTimeout(m.ctx, 5*time.Second)
+		defer cancel()
+
+		// Fetch the compose projects
+		projects, err := m.docker.ListComposeProjects(ctx)
+		if err != nil {
+			return errorMsg{err: err}
+		}
+
+		return composeListMsg{
+			projects: projects,
+		}
+	}
+}
+
+type errorMsg struct {
+	err error
+}
+
+// fetchSystemInfo fetches system-wide Docker information
+func (m FullModel) fetchSystemInfo() tea.Msg {
+	info, err := m.docker.GetSystemInfo(m.ctx)
+	if err != nil {
+		return fullErrMsg{err}
+	}
+	return fullSystemInfoMsg{info: info}
+}
+
+// Add the message type
+type fullSystemInfoMsg struct {
+	info docker.SystemInfo
+}
+
+// Add a new message type for clearing status
+type statusClearMsg struct{}

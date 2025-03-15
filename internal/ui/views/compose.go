@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -601,4 +602,198 @@ func FetchComposeContainers(
 	}
 
 	return composeContainers, nil
+}
+
+// ComposeServiceDetails renders detailed information for a specific Docker Compose service
+func ComposeServiceDetails(
+	ctx context.Context,
+	dockerService *docker.Service,
+	projectPath string,
+	serviceName string,
+	viewportWidth int,
+) string {
+	var sb strings.Builder
+
+	// Define styles
+	headerStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#00ADD8")).MarginBottom(1)
+	sectionStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FFDD00")).MarginTop(1)
+	labelStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FFFFFF"))
+	valueStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#AAAAAA"))
+	errorStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FF0000"))
+	warnStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FFAA00"))
+	successStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#00FF00"))
+
+	// Add the header
+	sb.WriteString(headerStyle.Render(fmt.Sprintf("Docker Compose Service: %s", serviceName)))
+	sb.WriteString("\n\n")
+
+	// Try to fetch detailed information about the service
+	serviceDetails, err := dockerService.FetchComposeServiceDetails(ctx, projectPath, serviceName)
+	if err != nil {
+		sb.WriteString(errorStyle.Render(fmt.Sprintf("Error fetching service details: %v", err)))
+
+		// Provide some helpful troubleshooting information
+		sb.WriteString("\n\n")
+		sb.WriteString(sectionStyle.Render("Troubleshooting:"))
+		sb.WriteString("\n")
+		sb.WriteString("1. Ensure Docker Compose is correctly installed and in your PATH\n")
+		sb.WriteString("2. Check if the service exists in your compose file\n")
+		sb.WriteString("3. Verify that you have the necessary permissions to access the Docker daemon\n")
+
+		// Try to get the compose file content
+		cmd := exec.Command("cat", filepath.Join(projectPath, "docker-compose.yml"))
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			// Try alternate filename
+			cmd = exec.Command("cat", filepath.Join(projectPath, "compose.yaml"))
+			output, err = cmd.CombinedOutput()
+		}
+
+		if err == nil && len(output) > 0 {
+			sb.WriteString("\n")
+			sb.WriteString(sectionStyle.Render("Compose File Content:"))
+			sb.WriteString("\n")
+			sb.WriteString("```yaml\n")
+			sb.WriteString(string(output))
+			sb.WriteString("\n```\n")
+		}
+
+		return sb.String()
+	}
+
+	// Display service information
+	// Basic information section
+	sb.WriteString(sectionStyle.Render("Basic Information:"))
+	sb.WriteString("\n")
+
+	sb.WriteString(labelStyle.Render("Name: "))
+	sb.WriteString(valueStyle.Render(serviceDetails.Name))
+	sb.WriteString("\n")
+
+	sb.WriteString(labelStyle.Render("Image: "))
+	sb.WriteString(valueStyle.Render(serviceDetails.Image))
+	sb.WriteString("\n")
+
+	sb.WriteString(labelStyle.Render("Status: "))
+	switch strings.ToLower(serviceDetails.Status) {
+	case "running", "up":
+		sb.WriteString(successStyle.Render(serviceDetails.Status))
+	case "exited", "stopped", "down":
+		sb.WriteString(errorStyle.Render(serviceDetails.Status))
+	default:
+		sb.WriteString(warnStyle.Render(serviceDetails.Status))
+	}
+	sb.WriteString("\n")
+
+	// Port information
+	if len(serviceDetails.Ports) > 0 {
+		sb.WriteString("\n")
+		sb.WriteString(sectionStyle.Render("Port Mappings:"))
+		sb.WriteString("\n")
+
+		for _, port := range serviceDetails.Ports {
+			sb.WriteString(fmt.Sprintf("• %s\n", port))
+		}
+	}
+
+	// Container information
+	if len(serviceDetails.Containers) > 0 {
+		sb.WriteString("\n")
+		sb.WriteString(sectionStyle.Render("Containers:"))
+		sb.WriteString("\n")
+
+		for _, containerID := range serviceDetails.Containers {
+			// Try to get more information about this container
+			container, err := dockerService.InspectContainer(ctx, containerID)
+			if err != nil {
+				sb.WriteString(fmt.Sprintf("• %s (Error: %v)\n", containerID, err))
+				continue
+			}
+
+			// Parse the container information (it's in JSON format)
+			var containerInfo map[string]interface{}
+			if err := json.Unmarshal([]byte(container), &containerInfo); err != nil {
+				sb.WriteString(fmt.Sprintf("• %s (Error parsing details)\n", containerID))
+				continue
+			}
+
+			// Extract name from the container info
+			var name string
+			if nameVal, ok := containerInfo["Name"].(string); ok {
+				name = nameVal
+				// Remove leading slash if present
+				if strings.HasPrefix(name, "/") {
+					name = name[1:]
+				}
+			} else {
+				name = containerID
+			}
+
+			// Get container status
+			var status string
+			if state, ok := containerInfo["State"].(map[string]interface{}); ok {
+				if statusVal, ok := state["Status"].(string); ok {
+					status = statusVal
+				}
+			}
+
+			// Create the container line with status indication
+			statusIndicator := "⚪" // Default unknown
+			if status == "running" {
+				statusIndicator = "🟢" // Green circle for running
+			} else if status == "exited" || status == "stopped" {
+				statusIndicator = "🔴" // Red circle for stopped
+			} else if status == "paused" {
+				statusIndicator = "⏸️" // Pause symbol for paused
+			}
+
+			sb.WriteString(fmt.Sprintf("• %s %s (%s)\n", statusIndicator, name, containerID[:12]))
+		}
+	}
+
+	// Resource usage
+	sb.WriteString("\n")
+	sb.WriteString(sectionStyle.Render("Resource Usage:"))
+	sb.WriteString("\n")
+
+	// CPU usage
+	sb.WriteString(labelStyle.Render("CPU: "))
+	sb.WriteString(valueStyle.Render(fmt.Sprintf("%.2f%%", serviceDetails.CPU)))
+	sb.WriteString("\n")
+
+	// Memory usage
+	sb.WriteString(labelStyle.Render("Memory: "))
+	memoryUsageStr := formatBytes(serviceDetails.Memory)
+	memoryLimitStr := formatBytes(serviceDetails.MemoryLimit)
+	memoryPercentage := 0.0
+	if serviceDetails.MemoryLimit > 0 {
+		memoryPercentage = float64(serviceDetails.Memory) / float64(serviceDetails.MemoryLimit) * 100.0
+	}
+	sb.WriteString(valueStyle.Render(fmt.Sprintf("%s / %s (%.2f%%)", memoryUsageStr, memoryLimitStr, memoryPercentage)))
+	sb.WriteString("\n")
+
+	// Add actions the user can take
+	sb.WriteString("\n")
+	sb.WriteString(sectionStyle.Render("Actions:"))
+	sb.WriteString("\n")
+	sb.WriteString("• Press 'u' to start the service\n")
+	sb.WriteString("• Press 'd' to stop the service\n")
+	sb.WriteString("• Press 'p' to pull the service image\n")
+	sb.WriteString("• Press 'r' to restart the service\n")
+
+	return sb.String()
+}
+
+// Helper function to format bytes to human-readable format
+func formatBytes(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := int64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
